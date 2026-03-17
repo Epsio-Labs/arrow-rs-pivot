@@ -88,21 +88,25 @@ impl Bytes {
         self
     }
 
+    /// Length in bytes
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Is the bytes empty?
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// A pointer to the base of this buffer
     #[inline]
     pub fn ptr(&self) -> NonNull<u8> {
         self.ptr
     }
 
+    /// Total capacity of this bytes
     pub fn capacity(&self) -> usize {
         match self.deallocation {
             Deallocation::Standard(layout) => layout.size(),
