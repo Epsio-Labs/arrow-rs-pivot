@@ -442,10 +442,16 @@ fn sort_byte_view<T: ByteViewType>(
 ) -> UInt32Array {
     // 1. Build a list of (index, raw_view, length)
     let mut valids: Vec<_>;
-    // 2. Compute the number of non-null entries to partially sort
-    let vlimit: usize = match (limit, options.nulls_first) {
-        (Some(l), true) => l.saturating_sub(nulls.len()).min(value_indices.len()),
-        _ => value_indices.len(),
+    // 2. Compute the number of non-null entries to partially sort. With a
+    //    `limit`, only the first `limit` output rows are kept, so we only need
+    //    that many entries fully ordered — partial-sorting to `vlimit` instead
+    //    of the whole array turns an O(n log n) sort into an O(n) selection.
+    //    nulls-first reserves the leading slots for nulls; nulls-last keeps the
+    //    valids first, so it still needs the smallest `limit` of them.
+    let vlimit: usize = match limit {
+        Some(l) if options.nulls_first => l.saturating_sub(nulls.len()).min(value_indices.len()),
+        Some(l) => l.min(value_indices.len()),
+        None => value_indices.len(),
     };
     // 3.a Check if all views are inline (no data buffers)
     if values.data_buffers().is_empty() {
@@ -634,9 +640,13 @@ fn sort_impl<T: Copy>(
     limit: Option<usize>,
     mut cmp: impl FnMut(T, T) -> Ordering,
 ) -> Vec<u32> {
-    let v_limit = match (limit, options.nulls_first) {
-        (Some(l), true) => l.saturating_sub(nulls.len()).min(valids.len()),
-        _ => valids.len(),
+    // Only the first `limit` rows are kept, so partial-sort to `v_limit`
+    // (O(n) selection) instead of fully ordering the whole array. nulls-last
+    // keeps the valids first, so it still needs the smallest `limit` of them.
+    let v_limit = match limit {
+        Some(l) if options.nulls_first => l.saturating_sub(nulls.len()).min(valids.len()),
+        Some(l) => l.min(valids.len()),
+        None => valids.len(),
     };
 
     match options.descending {
