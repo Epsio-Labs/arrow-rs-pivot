@@ -306,6 +306,14 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         &self.buffers
     }
 
+    /// Returns the shared `Arc` over the data buffers. Lets callers detect when
+    /// two arrays share the exact same buffer set (`Arc::ptr_eq`) and reuse it
+    /// instead of rebuilding the buffer list (e.g. zero-copy `take`/`concat`).
+    #[inline]
+    pub fn data_buffers_arc(&self) -> &Arc<[Buffer]> {
+        &self.buffers
+    }
+
     /// Returns the element at index `i`
     ///
     /// Note: This method does not check for nulls and the value is arbitrary

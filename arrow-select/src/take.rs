@@ -602,9 +602,13 @@ fn take_byte_view<T: ByteViewType, IndexType: ArrowPrimitiveType>(
 ) -> Result<GenericByteViewArray<T>, ArrowError> {
     let new_views = take_native(array.views(), indices);
     let new_nulls = take_nulls(array.nulls(), indices);
+    // Reuse the source's buffer `Arc` rather than cloning the whole list into a
+    // fresh one: the gathered views still index into the same buffers, so this is
+    // O(1) in the buffer count and preserves `Arc` identity (letting a downstream
+    // `concat` of same-source arrays skip rebuilding the buffer list entirely).
     // Safety:  array.views was valid, and take_native copies only valid values, and verifies bounds
     Ok(unsafe {
-        GenericByteViewArray::new_unchecked(new_views, array.data_buffers().to_vec(), new_nulls)
+        GenericByteViewArray::new_unchecked(new_views, array.data_buffers_arc().clone(), new_nulls)
     })
 }
 

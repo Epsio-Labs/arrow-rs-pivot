@@ -89,12 +89,63 @@ fn fixed_size_list_capacity(arrays: &[&dyn Array], data_type: &DataType) -> Capa
 }
 
 fn concat_byte_view<B: ByteViewType>(arrays: &[&dyn Array]) -> Result<ArrayRef, ArrowError> {
+    // Fast path: when every input shares the exact same data-buffer `Arc`, their
+    // views already index into it, so the concatenation is just the views appended
+    // verbatim over the same buffers: no per-buffer clone, no `buffer_index`
+    // remap, no byte copy. This is what makes a high-partition-count group output
+    // (every batch viewing the one shared arena buffer list) cheap to merge.
+    //
+    // Check shared-ness before materializing anything, so the common (distinct
+    // buffers) path falls straight through to the builder without an extra `Vec`.
+    if let [first, rest @ ..] = arrays {
+        let first = first.as_byte_view::<B>();
+        let shared = first.data_buffers_arc();
+        if !shared.is_empty()
+            && rest
+                .iter()
+                .all(|a| Arc::ptr_eq(a.as_byte_view::<B>().data_buffers_arc(), shared))
+        {
+            let views: Vec<&GenericByteViewArray<B>> =
+                arrays.iter().map(|a| a.as_byte_view::<B>()).collect();
+            let total: usize = views.iter().map(|a| a.len()).sum();
+            let mut combined_views = Vec::with_capacity(total);
+            for a in &views {
+                combined_views.extend_from_slice(a.views());
+            }
+            let nulls = concat_view_nulls(&views, total);
+            // Safety: every view was valid against `shared`, which is unchanged, so
+            // the appended views remain in bounds for the same buffers.
+            return Ok(Arc::new(unsafe {
+                GenericByteViewArray::<B>::new_unchecked(combined_views.into(), shared.clone(), nulls)
+            }));
+        }
+    }
+
     let mut builder =
         GenericByteViewBuilder::<B>::with_capacity(arrays.iter().map(|a| a.len()).sum());
     for &array in arrays.iter() {
         builder.append_array(array.as_byte_view());
     }
     Ok(Arc::new(builder.finish()))
+}
+
+/// Concatenate the null masks of same-buffer view arrays (fast-path helper).
+/// Returns `None` when every input is non-null.
+fn concat_view_nulls<B: ByteViewType>(
+    views: &[&GenericByteViewArray<B>],
+    total: usize,
+) -> Option<NullBuffer> {
+    if views.iter().all(|a| a.nulls().is_none()) {
+        return None;
+    }
+    let mut builder = BooleanBufferBuilder::new(total);
+    for a in views {
+        match a.nulls() {
+            Some(n) => builder.append_buffer(n.inner()),
+            None => builder.append_n(a.len(), true),
+        }
+    }
+    Some(NullBuffer::new(builder.finish()))
 }
 
 fn concat_dictionaries<K: ArrowDictionaryKeyType>(
@@ -744,6 +795,31 @@ mod tests {
             Some("baz"),
         ])) as ArrayRef;
 
+        assert_eq!(&arr, &expected_output);
+    }
+
+    #[test]
+    fn test_concat_string_view_shared_buffers_with_nulls() {
+        // Slices of one array share its data-buffer `Arc`, so `concat` takes the
+        // shared-buffer fast path; the long strings stay out-of-line (non-empty
+        // data buffers) and the null exercises `concat_view_nulls`.
+        let source = StringViewArray::from(vec![
+            Some("aaaaaaaaaaaaaaaaa"),
+            None,
+            Some("bbbbbbbbbbbbbbbbb"),
+            Some("ccccccccccccccccc"),
+        ]);
+        let first = source.slice(0, 2);
+        let second = source.slice(2, 2);
+
+        let arr = concat(&[&first, &second]).unwrap();
+
+        let expected_output = Arc::new(StringViewArray::from(vec![
+            Some("aaaaaaaaaaaaaaaaa"),
+            None,
+            Some("bbbbbbbbbbbbbbbbb"),
+            Some("ccccccccccccccccc"),
+        ])) as ArrayRef;
         assert_eq!(&arr, &expected_output);
     }
 
