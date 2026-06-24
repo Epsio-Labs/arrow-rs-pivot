@@ -1714,6 +1714,32 @@ mod tests {
         _test_byte_view::<BinaryViewType>()
     }
 
+    #[test]
+    fn test_take_string_view_reuses_source_buffers() {
+        let source = StringViewArray::from(vec![
+            Some("aaaaaaaaaaaaaaaaa"),
+            None,
+            Some("bbbbbbbbbbbbbbbbb"),
+            Some("ccccccccccccccccc"),
+        ]);
+        let indices = UInt32Array::from(vec![3, 0, 2]);
+
+        let taken = take(&source, &indices, None).unwrap();
+        let taken = taken.as_string_view();
+
+        assert_eq!(
+            taken.iter().collect::<Vec<_>>(),
+            vec![
+                Some("ccccccccccccccccc"),
+                Some("aaaaaaaaaaaaaaaaa"),
+                Some("bbbbbbbbbbbbbbbbb"),
+            ]
+        );
+        // The gather reuses the source's buffer `Arc` rather than cloning the list,
+        // so a downstream `concat` of takes from this source can reuse it.
+        assert!(Arc::ptr_eq(taken.data_buffers_arc(), source.data_buffers_arc()));
+    }
+
     macro_rules! test_take_list {
         ($offset_type:ty, $list_data_type:ident, $list_array_type:ident) => {{
             // Construct a value array, [[0,0,0], [-1,-2,-1], [], [2,3]]

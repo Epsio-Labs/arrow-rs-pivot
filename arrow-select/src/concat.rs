@@ -38,7 +38,8 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::*;
 use arrow_buffer::{
-    ArrowNativeType, BooleanBufferBuilder, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
+    ArrowNativeType, BooleanBufferBuilder, MutableBuffer, NullBuffer, NullBufferBuilder,
+    OffsetBuffer, ScalarBuffer,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_data::transform::{Capacities, MutableArrayData};
@@ -135,17 +136,17 @@ fn concat_view_nulls<B: ByteViewType>(
     views: &[&GenericByteViewArray<B>],
     total: usize,
 ) -> Option<NullBuffer> {
-    if views.iter().all(|a| a.nulls().is_none()) {
-        return None;
-    }
-    let mut builder = BooleanBufferBuilder::new(total);
+    // `NullBufferBuilder` stays unmaterialized while every input is non-null and
+    // `finish()` then returns `None`, so it handles the all-valid short-circuit
+    // and the canonical offset-aware buffer concatenation in one place.
+    let mut builder = NullBufferBuilder::new(total);
     for a in views {
         match a.nulls() {
-            Some(n) => builder.append_buffer(n.inner()),
-            None => builder.append_n(a.len(), true),
+            Some(n) => builder.append_buffer(n),
+            None => builder.append_n_non_nulls(a.len()),
         }
     }
-    Some(NullBuffer::new(builder.finish()))
+    builder.finish()
 }
 
 fn concat_dictionaries<K: ArrowDictionaryKeyType>(
@@ -819,6 +820,42 @@ mod tests {
             None,
             Some("bbbbbbbbbbbbbbbbb"),
             Some("ccccccccccccccccc"),
+        ])) as ArrayRef;
+        assert_eq!(&arr, &expected_output);
+    }
+
+    #[test]
+    fn test_concat_string_view_shared_buffers_three_slices() {
+        // More than two inputs all sharing the one buffer `Arc`: the fast path must
+        // append every slice's views in order over the shared buffers.
+        let source = StringViewArray::from(vec![
+            Some("aaaaaaaaaaaaaaaaa"),
+            Some("bbbbbbbbbbbbbbbbb"),
+            Some("ccccccccccccccccc"),
+            None,
+            Some("ddddddddddddddddd"),
+            Some("eeeeeeeeeeeeeeeee"),
+        ]);
+        let parts = [source.slice(0, 2), source.slice(2, 2), source.slice(4, 2)];
+
+        let arr = concat(&[&parts[0], &parts[1], &parts[2]]).unwrap();
+
+        assert_eq!(&arr, &(Arc::new(source) as ArrayRef));
+    }
+
+    #[test]
+    fn test_concat_string_view_distinct_buffers_falls_back() {
+        // Two independently built arrays own different buffers, so the shared-buffer
+        // fast path must not fire; the builder fallback still concatenates correctly.
+        let a = StringViewArray::from(vec![Some("aaaaaaaaaaaaaaaaa"), None]);
+        let b = StringViewArray::from(vec![Some("bbbbbbbbbbbbbbbbb")]);
+
+        let arr = concat(&[&a, &b]).unwrap();
+
+        let expected_output = Arc::new(StringViewArray::from(vec![
+            Some("aaaaaaaaaaaaaaaaa"),
+            None,
+            Some("bbbbbbbbbbbbbbbbb"),
         ])) as ArrayRef;
         assert_eq!(&arr, &expected_output);
     }
