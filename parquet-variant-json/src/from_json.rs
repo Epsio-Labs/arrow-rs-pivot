@@ -17,8 +17,12 @@
 
 //! Module for parsing JSON strings as Variant
 
+use std::borrow::Cow;
+use std::fmt;
+
 use arrow_schema::ArrowError;
 use parquet_variant::{ObjectFieldBuilder, Variant, VariantBuilderExt};
+use serde::de::{DeserializeSeed, Deserializer, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde_json::{Number, Value};
 
 /// Converts a JSON string to Variant using a [`VariantBuilderExt`], such as
@@ -70,11 +74,120 @@ pub trait JsonToVariant {
 
 impl<T: VariantBuilderExt> JsonToVariant for T {
     fn append_json(&mut self, json: &str) -> Result<(), ArrowError> {
-        let json: Value = serde_json::from_str(json)
-            .map_err(|e| ArrowError::InvalidArgumentError(format!("JSON format error: {e}")))?;
-
-        append_json(&json, self)?;
+        // Stream the JSON straight into the builder. The obvious alternative --
+        // `serde_json::from_str` into a `Value` tree, then walk the tree with the
+        // `append_json` function below -- materializes the whole document as a
+        // throwaway tree of `Value` enums (a `BTreeMap` and a `String` per object
+        // field) only to copy it into the builder and drop it. The parser already
+        // visits the JSON depth-first, which is exactly the order the builder
+        // wants, so the tree buys nothing: we feed the builder from the parser
+        // directly and never allocate it.
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let to_arrow_err = |e| ArrowError::InvalidArgumentError(format!("JSON format error: {e}"));
+        VariantSeed(self)
+            .deserialize(&mut deserializer)
+            .map_err(to_arrow_err)?;
+        // Reject trailing content after the value, matching `from_str`.
+        deserializer.end().map_err(to_arrow_err)?;
         Ok(())
+    }
+}
+
+/// Streams one JSON value into `B`, appending it as it parses instead of building
+/// an intermediate [`Value`]. A seed (rather than a plain [`Visitor`]) so it can
+/// carry the `&mut` builder down through serde's element/field access.
+struct VariantSeed<'b, B: VariantBuilderExt>(&'b mut B);
+
+impl<'de, B: VariantBuilderExt> DeserializeSeed<'de> for VariantSeed<'_, B> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(VariantVisitor(self.0))
+    }
+}
+
+struct VariantVisitor<'b, B: VariantBuilderExt>(&'b mut B);
+
+impl<'de, B: VariantBuilderExt> Visitor<'de> for VariantVisitor<'_, B> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: DeError>(self, value: bool) -> Result<(), E> {
+        self.0.append_value(value);
+        Ok(())
+    }
+
+    fn visit_i64<E: DeError>(self, value: i64) -> Result<(), E> {
+        append_int(self.0, value);
+        Ok(())
+    }
+
+    fn visit_u64<E: DeError>(self, value: u64) -> Result<(), E> {
+        // Same as the `Value` path: a u64 that fits i64 takes the narrowest
+        // integer width; one that doesn't has no integer variant, so it falls
+        // back to a double.
+        match i64::try_from(value) {
+            Ok(value) => append_int(self.0, value),
+            Err(_) => self.0.append_value(value as f64),
+        }
+        Ok(())
+    }
+
+    fn visit_f64<E: DeError>(self, value: f64) -> Result<(), E> {
+        self.0.append_value(value);
+        Ok(())
+    }
+
+    fn visit_str<E: DeError>(self, value: &str) -> Result<(), E> {
+        self.0.append_value(value);
+        Ok(())
+    }
+
+    fn visit_unit<E: DeError>(self) -> Result<(), E> {
+        self.0.append_value(Variant::Null);
+        Ok(())
+    }
+
+    fn visit_none<E: DeError>(self) -> Result<(), E> {
+        self.0.append_value(Variant::Null);
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let mut list = self.0.try_new_list().map_err(A::Error::custom)?;
+        while seq.next_element_seed(VariantSeed(&mut list))?.is_some() {}
+        list.finish();
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut object = self.0.try_new_object().map_err(A::Error::custom)?;
+        // Borrow the key from the input where the parser can (an unescaped key),
+        // owning a copy only for an escaped one, rather than allocating a `String`
+        // per field as the `Value` tree would.
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            let mut field = ObjectFieldBuilder::new(key.as_ref(), &mut object);
+            map.next_value_seed(VariantSeed(&mut field))?;
+        }
+        object.finish();
+        Ok(())
+    }
+}
+
+/// Append a signed integer at the narrowest width that holds it, matching
+/// [`variant_from_number`] so the streaming and tree paths encode identical bytes.
+fn append_int(builder: &mut impl VariantBuilderExt, value: i64) {
+    if let Ok(value) = i8::try_from(value) {
+        builder.append_value(value);
+    } else if let Ok(value) = i16::try_from(value) {
+        builder.append_value(value);
+    } else if let Ok(value) = i32::try_from(value) {
+        builder.append_value(value);
+    } else {
+        builder.append_value(value);
     }
 }
 
