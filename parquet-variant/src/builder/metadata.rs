@@ -86,7 +86,9 @@ pub struct ReadOnlyMetadataBuilder<'m> {
     metadata: &'m VariantMetadata<'m>,
     // A cache that tracks field names this builder has already seen, because finding the field id
     // for a given field name is expensive -- O(n) for a large and unsorted metadata dictionary.
-    known_field_names: HashMap<&'m str, u32>,
+    // These builders are created per row, so the cache is hashed far more often than any attacker
+    // could influence it; a fast hasher over a DoS-resistant one.
+    known_field_names: HashMap<&'m str, u32, foldhash::fast::RandomState>,
 }
 
 impl<'m> ReadOnlyMetadataBuilder<'m> {
@@ -94,7 +96,7 @@ impl<'m> ReadOnlyMetadataBuilder<'m> {
     pub fn new(metadata: &'m VariantMetadata<'m>) -> Self {
         Self {
             metadata,
-            known_field_names: HashMap::new(),
+            known_field_names: HashMap::default(),
         }
     }
 }

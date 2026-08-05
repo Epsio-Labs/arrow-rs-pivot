@@ -33,6 +33,11 @@ use parquet_variant::{Variant, VariantBuilderExt, VariantPath, VariantPathElemen
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// The hasher for the per-field routing map. Field names are hashed once per
+/// field per row, so the default hasher's DoS resistance costs more than it is
+/// worth here; the schema is caller-controlled anyway.
+type FieldRouting<'a> = IndexMap<&'a str, VariantToShreddedVariantRowBuilder<'a>>;
+
 /// Shreds the input binary variant using a target shredding schema derived from the requested data type.
 ///
 /// For example, requesting `DataType::Int64` would produce an output variant array with the schema:
@@ -311,7 +316,11 @@ impl<'a> VariantToShreddedArrayVariantRowBuilder<'a> {
 
 pub(crate) struct VariantToShreddedObjectVariantRowBuilder<'a> {
     value_builder: VariantValueArrayBuilder,
-    typed_value_builders: IndexMap<&'a str, VariantToShreddedVariantRowBuilder<'a>>,
+    typed_value_builders: FieldRouting<'a>,
+    /// Which shredded fields the row being appended carried, by their position
+    /// in `typed_value_builders`. Reused across rows, so marking a row's fields
+    /// costs no allocation or hashing.
+    fields_seen: Vec<bool>,
     typed_value_nulls: NullBufferBuilder,
     nulls: NullBufferBuilder,
     top_level: bool,
@@ -336,6 +345,7 @@ impl<'a> VariantToShreddedObjectVariantRowBuilder<'a> {
         Ok(Self {
             value_builder: VariantValueArrayBuilder::new(capacity),
             typed_value_builders: typed_value_builders.collect::<Result<_>>()?,
+            fields_seen: vec![false; fields.len()],
             typed_value_nulls: NullBufferBuilder::new(capacity),
             nulls: NullBufferBuilder::new(capacity),
             top_level,
@@ -366,36 +376,43 @@ impl<'a> VariantToShreddedObjectVariantRowBuilder<'a> {
             return Ok(false);
         };
 
-        // Route the object's fields by name as either shredded or unshredded
-        let mut builder = self.value_builder.builder_ext(value.metadata());
-        let mut object_builder = builder.try_new_object()?;
-        let mut seen = std::collections::HashSet::new();
+        // Route the object's shredded fields into their typed builders, noting
+        // which fields turned up and whether any field must fall back to
+        // `value`. The residual object is not built yet: most rows of a
+        // shredding-friendly column carry only shredded fields, and building
+        // the residual costs a metadata builder and an object builder (a heap
+        // map each) that such rows would throw away unused.
+        self.fields_seen.fill(false);
         let mut partially_shredded = false;
-        for (field_name, value) in obj.iter() {
-            match self.typed_value_builders.get_mut(field_name) {
-                Some(typed_value_builder) => {
-                    typed_value_builder.append_value(value)?;
-                    seen.insert(field_name);
+        for (field_name, field_value) in obj.iter() {
+            match self.typed_value_builders.get_full_mut(field_name) {
+                Some((index, _, typed_value_builder)) => {
+                    typed_value_builder.append_value(field_value)?;
+                    self.fields_seen[index] = true;
                 }
-                None => {
-                    object_builder.insert_bytes(field_name, value);
-                    partially_shredded = true;
-                }
+                None => partially_shredded = true,
             }
         }
 
         // Handle missing fields
-        for (field_name, typed_value_builder) in &mut self.typed_value_builders {
-            if !seen.contains(field_name) {
+        for (index, (_, typed_value_builder)) in self.typed_value_builders.iter_mut().enumerate() {
+            if !self.fields_seen[index] {
                 typed_value_builder.append_null()?;
             }
         }
 
-        // Only emit the value if it captured any unshredded object fields
+        // Only rows with unshredded fields build the residual object, walking
+        // the document a second time to copy those fields' bytes across.
         if partially_shredded {
+            let mut builder = self.value_builder.builder_ext(value.metadata());
+            let mut object_builder = builder.try_new_object()?;
+            for (field_name, field_value) in obj.iter() {
+                if !self.typed_value_builders.contains_key(field_name) {
+                    object_builder.insert_bytes(field_name, field_value);
+                }
+            }
             object_builder.finish();
         } else {
-            drop(object_builder);
             self.value_builder.append_null();
         }
 
