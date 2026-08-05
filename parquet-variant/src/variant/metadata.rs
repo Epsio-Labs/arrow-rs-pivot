@@ -327,6 +327,13 @@ impl<'m> VariantMetadata<'m> {
         self.header.is_sorted
     }
 
+    /// The raw bytes of this metadata dictionary. Two variants whose metadata
+    /// bytes are equal share a dictionary, so field ids resolved against one
+    /// are valid against the other.
+    pub fn as_bytes(&self) -> &'m [u8] {
+        self.bytes
+    }
+
     /// The variant protocol version
     pub const fn version(&self) -> u8 {
         self.header.version

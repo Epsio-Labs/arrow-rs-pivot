@@ -29,7 +29,9 @@ use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, TimeUnit};
 use arrow::error::{ArrowError, Result};
 use indexmap::IndexMap;
-use parquet_variant::{Variant, VariantBuilderExt, VariantPath, VariantPathElement};
+use parquet_variant::{
+    Variant, VariantBuilderExt, VariantMetadata, VariantPath, VariantPathElement,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -322,6 +324,14 @@ pub(crate) struct VariantToShreddedObjectVariantRowBuilder<'a> {
     /// in `typed_value_builders`. Reused across rows, so marking a row's fields
     /// costs no allocation or hashing.
     fields_seen: Vec<bool>,
+    /// The metadata dictionary of the last row appended, and the routing its
+    /// field ids resolve to: `routing_by_field_id[id]` holds the position in
+    /// `typed_value_builders` of the field the dictionary names by `id`, when
+    /// that path is shredded. Rows of one shape carry byte-identical
+    /// dictionaries, so most rows route by field id alone and never resolve a
+    /// field name.
+    cached_dictionary: Vec<u8>,
+    routing_by_field_id: Vec<Option<u32>>,
     typed_value_nulls: NullBufferBuilder,
     nulls: NullBufferBuilder,
     top_level: bool,
@@ -347,10 +357,30 @@ impl<'a> VariantToShreddedObjectVariantRowBuilder<'a> {
             value_builder: VariantValueArrayBuilder::new(capacity),
             typed_value_builders: typed_value_builders.collect::<Result<_>>()?,
             fields_seen: vec![false; fields.len()],
+            cached_dictionary: Vec::new(),
+            routing_by_field_id: Vec::new(),
             typed_value_nulls: NullBufferBuilder::new(capacity),
             nulls: NullBufferBuilder::new(capacity),
             top_level,
         })
+    }
+
+    /// Resolve which of `metadata`'s field ids name shredded paths. Runs once
+    /// per distinct dictionary rather than once per row; a metadata dictionary
+    /// is never empty, so the initial empty cache matches no row.
+    fn rebuild_routing(&mut self, metadata: &VariantMetadata<'_>) -> Result<()> {
+        self.cached_dictionary.clear();
+        self.cached_dictionary
+            .extend_from_slice(metadata.as_bytes());
+        self.routing_by_field_id.clear();
+        self.routing_by_field_id.resize(metadata.len(), None);
+        for field_id in 0..metadata.len() {
+            let field_name = metadata.get(field_id)?;
+            if let Some(index) = self.typed_value_builders.get_index_of(field_name) {
+                self.routing_by_field_id[field_id] = Some(index as u32);
+            }
+        }
+        Ok(())
     }
 
     fn append_null(&mut self) -> Result<()> {
@@ -383,13 +413,27 @@ impl<'a> VariantToShreddedObjectVariantRowBuilder<'a> {
         // shredding-friendly column carry only shredded fields, and building
         // the residual costs a metadata builder and an object builder (a heap
         // map each) that such rows would throw away unused.
+        //
+        // Fields route by their id in the row's metadata dictionary, against a
+        // resolution cached from the previous row: rows of one shape carry
+        // byte-identical dictionaries, so the names only have to be resolved
+        // when the dictionary actually changes.
+        if value.metadata().as_bytes() != self.cached_dictionary.as_slice() {
+            self.rebuild_routing(value.metadata())?;
+        }
         self.fields_seen.fill(false);
         let mut partially_shredded = false;
-        for (field_name, field_value) in obj.iter() {
-            match self.typed_value_builders.get_full_mut(field_name) {
-                Some((index, _, typed_value_builder)) => {
+        for i in 0..obj.len() {
+            let field_id = obj.field_id(i).expect("the index is in range") as usize;
+            match self.routing_by_field_id.get(field_id).copied().flatten() {
+                Some(builder_index) => {
+                    let field_value = obj.field(i).expect("the index is in range");
+                    let (_, typed_value_builder) = self
+                        .typed_value_builders
+                        .get_index_mut(builder_index as usize)
+                        .expect("the routing indexes the builders");
                     typed_value_builder.append_value(field_value)?;
-                    self.fields_seen[index] = true;
+                    self.fields_seen[builder_index as usize] = true;
                 }
                 None => partially_shredded = true,
             }

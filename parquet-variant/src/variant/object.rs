@@ -355,10 +355,28 @@ impl<'m, 'v> VariantObject<'m, 'v> {
 
     /// Fallible version of `field_name`. Returns field name by index, capturing validation errors
     fn try_field_name(&self, i: usize) -> Result<&'m str, ArrowError> {
+        let field_id = self.try_field_id(i)?;
+        self.metadata.get(field_id as _)
+    }
+
+    /// Get a field's id in the metadata dictionary by index in `0..self.len()`,
+    /// without resolving the name it stands for.
+    ///
+    /// # Panics
+    /// If the variant object is corrupted (e.g., invalid offsets or field IDs).
+    /// This should never happen since the constructor validates all data upfront.
+    pub fn field_id(&self, i: usize) -> Option<u32> {
+        (i < self.len()).then(|| {
+            self.try_field_id(i)
+                .expect("Invalid variant object field id")
+        })
+    }
+
+    /// Fallible version of `field_id`. Returns the field id by index, capturing validation errors
+    fn try_field_id(&self, i: usize) -> Result<u32, ArrowError> {
         let byte_range = self.header.field_ids_start_byte() as _..self.first_field_offset_byte as _;
         let field_id_bytes = slice_from_slice(self.value, byte_range)?;
-        let field_id = self.header.field_id_size.unpack_u32(field_id_bytes, i)?;
-        self.metadata.get(field_id as _)
+        self.header.field_id_size.unpack_u32(field_id_bytes, i)
     }
 
     /// Returns an iterator of (name, value) pairs over the fields of this object.
