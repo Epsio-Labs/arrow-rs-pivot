@@ -36,7 +36,8 @@ use std::sync::Arc;
 /// The hasher for the per-field routing map. Field names are hashed once per
 /// field per row, so the default hasher's DoS resistance costs more than it is
 /// worth here; the schema is caller-controlled anyway.
-type FieldRouting<'a> = IndexMap<&'a str, VariantToShreddedVariantRowBuilder<'a>>;
+type FieldRouting<'a> =
+    IndexMap<&'a str, VariantToShreddedVariantRowBuilder<'a>, foldhash::fast::RandomState>;
 
 /// Shreds the input binary variant using a target shredding schema derived from the requested data type.
 ///
