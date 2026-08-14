@@ -229,6 +229,31 @@ fn add_benchmark(c: &mut Criterion) {
         b.iter(|| eq(&string_view_scalar, &string_view_left).unwrap())
     });
 
+    // Short values in an array that also owns buffers, which is what any
+    // Parquet reader produces: one long value anywhere in the column, or a
+    // dictionary's buffers carried along, and the array owns buffers while
+    // almost every value it holds is still inlined. Comparing those short
+    // values should cost no more than it does in an array with no buffers at
+    // all, so the two benches below are meant to run at the same speed.
+    let mut inlined_with_buffer: Vec<Option<String>> =
+        make_inlined_string_array(SIZE, &mut rng).collect();
+    inlined_with_buffer[0] = Some("a value far too long to be inlined".to_string());
+    let string_view_inlined_with_buffer =
+        StringViewArray::from_iter(inlined_with_buffer.iter().map(|v| v.as_deref()));
+    assert!(!string_view_inlined_with_buffer.data_buffers().is_empty());
+
+    let string_view_inlined_only =
+        StringViewArray::from_iter(make_inlined_string_array(SIZE, &mut rng));
+    assert!(string_view_inlined_only.data_buffers().is_empty());
+
+    let string_view_scalar = StringViewArray::new_scalar("xxxx");
+    c.bench_function("eq scalar StringViewArray inlined, no buffers", |b| {
+        b.iter(|| eq(&string_view_scalar, &string_view_inlined_only).unwrap())
+    });
+    c.bench_function("eq scalar StringViewArray inlined, array owns buffers", |b| {
+        b.iter(|| eq(&string_view_scalar, &string_view_inlined_with_buffer).unwrap())
+    });
+
     c.bench_function("eq StringArray StringArray", |b| {
         b.iter(|| eq(&string_left, &string_right).unwrap())
     });
