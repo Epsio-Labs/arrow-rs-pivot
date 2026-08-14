@@ -243,6 +243,23 @@ fn compare_op(op: Op, lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, 
         )));
     }
 
+    // Comparing a whole byte-view column against one constant that fits inside
+    // a view is the shape a `WHERE col = 'k'` takes, and it collapses to one
+    // integer compare per row: the constant resolves to a view once, and a
+    // value equals it exactly when their views match. Worth lifting out of the
+    // generic path, which re-resolves the scalar and re-tests its buffers for
+    // every row and cannot vectorize through the per-row closure.
+    if matches!(op, Op::Equal | Op::NotEqual)
+        && l_v.is_none()
+        && r_v.is_none()
+        && !l_s
+        && r_s
+        && let Some(mask) = eq_inline_scalar(l, r, l_t, matches!(op, Op::NotEqual))
+    {
+        let nulls = NullBuffer::union(l_nulls.as_ref(), r_nulls.as_ref());
+        return Ok(BooleanArray::new(mask, nulls));
+    }
+
     // Defer computation as may not be necessary
     let values = || -> BooleanBuffer {
         let d = downcast_primitive_array! {
@@ -323,6 +340,73 @@ fn compare_op(op: Op, lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, 
         }
         // Neither side is nullable
         (None, _, None, _) => BooleanArray::new(values(), None),
+    })
+}
+
+/// Compare every value of a byte-view array against one constant, when that
+/// constant is short enough to live inside a view.
+///
+/// Then "equals the constant" is exactly "has the constant's view", so the
+/// whole column is a scan of `u128`s against a fixed one: no buffer is read, no
+/// scalar is re-resolved, and the loop is branch-free enough to vectorize.
+/// Returns `None` for anything else, which falls through to the generic path.
+fn eq_inline_scalar(
+    l: &dyn Array,
+    r: &dyn Array,
+    data_type: &arrow_schema::DataType,
+    negate: bool,
+) -> Option<BooleanBuffer> {
+    let (values, needle) = match data_type {
+        arrow_schema::DataType::Utf8View => {
+            let r = r.as_string_view();
+            (l.as_string_view().views(), *r.views().first()?)
+        }
+        arrow_schema::DataType::BinaryView => {
+            let r = r.as_binary_view();
+            (l.as_binary_view().views(), *r.views().first()?)
+        }
+        _ => return None,
+    };
+    let needle_len = needle as u32;
+    if needle_len > MAX_INLINE_LEN {
+        return None;
+    }
+    // Compare the length and the constant's own bytes, and nothing else: a
+    // value of any other length fails on the length alone, and an inlined
+    // view's remaining bytes are padding a producer need not zero.
+    //
+    // Width matters as much as masking. The bytes that decide it span the low
+    // 4, 8 or 16 of the view, and comparing 16 where 4 would do costs real
+    // time - a u128 is two registers - so each case uses the narrowest integer
+    // that covers the constant. The empty constant lands on the first, where
+    // the test is exactly "is the length zero".
+    let len = values.len();
+    Some(match needle_len {
+        0 => collect_bool(len, negate, |idx| {
+            // Safety: `idx` is bounded by the length `collect_bool` was given.
+            unsafe { *values.get_unchecked(idx) as u32 == 0 }
+        }),
+        1..=4 => {
+            // A four-byte constant spans the whole low half, where the shift
+            // that would build the mask is exactly the width of the type.
+            let bits = 32 + needle_len * 8;
+            let significant = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let needle = needle as u64 & significant;
+            collect_bool(len, negate, |idx| unsafe {
+                *values.get_unchecked(idx) as u64 & significant == needle
+            })
+        }
+        _ => {
+            let significant = inline_mask(needle_len);
+            let needle = needle & significant;
+            collect_bool(len, negate, |idx| unsafe {
+                *values.get_unchecked(idx) & significant == needle
+            })
+        }
     })
 }
 
@@ -479,6 +563,22 @@ fn apply_op_vectored<T: ArrayOrd>(
     })
 }
 
+/// Longest value a byte view stores inside itself rather than in a buffer.
+const MAX_INLINE_LEN: u32 = 12;
+
+/// Mask over the part of an inlined view that carries meaning: its length, plus
+/// exactly `len` bytes of data. The remaining inline bytes are padding, which a
+/// producer may leave as anything, so they must not take part in a comparison.
+#[inline(always)]
+fn inline_mask(len: u32) -> u128 {
+    let bits = 32 + len * 8;
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
 trait ArrayOrd {
     type Item: Copy;
 
@@ -568,9 +668,18 @@ impl<'a, T: ByteViewType> ArrayOrd for &'a GenericByteViewArray<T> {
     fn is_eq(l: Self::Item, r: Self::Item) -> bool {
         let l_view = unsafe { l.0.views().get_unchecked(l.1) };
         let r_view = unsafe { r.0.views().get_unchecked(r.1) };
-        if l.0.data_buffers().is_empty() && r.0.data_buffers().is_empty() {
-            // For eq case, we can directly compare the inlined bytes
-            return l_view == r_view;
+        // Whether the *values* are inlined, not whether the arrays happen to
+        // own buffers. Asking the arrays is both weaker and much easier to lose:
+        // an array carrying a buffer for some long value, or handed its
+        // dictionary's buffers wholesale, answers "not inlined" for every one of
+        // its short values and forfeits this path entirely. The lengths are
+        // already in hand, so ask them, and compare only the bytes the length
+        // covers - the rest of an inlined view is padding a producer is not
+        // obliged to zero.
+        let l_len = *l_view as u32;
+        if l_len <= MAX_INLINE_LEN && (*r_view as u32) <= MAX_INLINE_LEN {
+            let significant = inline_mask(l_len);
+            return l_view & significant == r_view & significant;
         }
 
         // Fast path for same view (and both inlined)
