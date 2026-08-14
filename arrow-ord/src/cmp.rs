@@ -664,18 +664,9 @@ impl<'a, T: ByteViewType> ArrayOrd for &'a GenericByteViewArray<T> {
     fn is_eq(l: Self::Item, r: Self::Item) -> bool {
         let l_view = unsafe { l.0.views().get_unchecked(l.1) };
         let r_view = unsafe { r.0.views().get_unchecked(r.1) };
-        // Whether the *values* are inlined, not whether the arrays happen to
-        // own buffers. Asking the arrays is both weaker and much easier to lose:
-        // an array carrying a buffer for some long value, or handed its
-        // dictionary's buffers wholesale, answers "not inlined" for every one of
-        // its short values and forfeits this path entirely. The lengths are
-        // already in hand, so ask them, and compare only the bytes the length
-        // covers - the rest of an inlined view is padding a producer is not
-        // obliged to zero.
-        let l_len = *l_view as u32;
-        if l_len <= MAX_INLINE_LEN && (*r_view as u32) <= MAX_INLINE_LEN {
-            let significant = inline_mask(l_len);
-            return l_view & significant == r_view & significant;
+        if l.0.data_buffers().is_empty() && r.0.data_buffers().is_empty() {
+            // For eq case, we can directly compare the inlined bytes
+            return l_view == r_view;
         }
 
         // Fast path for same view (and both inlined)
