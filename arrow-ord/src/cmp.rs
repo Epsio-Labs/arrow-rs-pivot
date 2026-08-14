@@ -254,9 +254,13 @@ fn compare_op(op: Op, lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, 
         && r_v.is_none()
         && !l_s
         && r_s
+        // A null constant compares null against everything, which is the
+        // generic path's business: it has one null to spread over every row,
+        // where this path only ever carries the array's own.
+        && r_nulls.as_ref().is_none_or(|nulls| nulls.null_count() == 0)
         && let Some(mask) = eq_inline_scalar(l, r, l_t, matches!(op, Op::NotEqual))
     {
-        let nulls = NullBuffer::union(l_nulls.as_ref(), r_nulls.as_ref());
+        let nulls = l_nulls.filter(|nulls| nulls.null_count() > 0);
         return Ok(BooleanArray::new(mask, nulls));
     }
 
@@ -1085,6 +1089,30 @@ mod tests {
             eq(&a, &b).unwrap(),
             BooleanArray::from(vec![Some(false), Some(true)])
         );
+    }
+
+    /// A NULL row compares NULL whichever side it is on, and a null row's view
+    /// is arbitrary, so the answer must come from validity rather than bytes.
+    #[test]
+    fn test_byte_view_eq_null_row() {
+        let a = arrow_array::StringViewArray::from(vec![Some(""), Some("x"), None]);
+        let needle = arrow_array::StringViewArray::from(vec![""]);
+        let r = neq(&a, &Scalar::new(&needle)).unwrap();
+        assert_eq!(r.len(), 3);
+        assert!(!r.value(0));
+        assert!(r.value(1));
+        assert!(r.is_null(2), "a null row stays null, got {r:?}");
+    }
+
+    /// A NULL constant makes every comparison NULL, whatever the values are.
+    /// The inline-scalar path must not answer this one from the views.
+    #[test]
+    fn test_byte_view_eq_null_scalar() {
+        let a = arrow_array::StringViewArray::from(vec![Some(""), Some("x"), None]);
+        let needle = arrow_array::StringViewArray::new_null(1);
+        let r = neq(&a, &Scalar::new(&needle)).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.null_count(), 3, "every row must be NULL, got {r:?}");
     }
 
     #[test]
