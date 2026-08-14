@@ -243,6 +243,23 @@ fn compare_op(op: Op, lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, 
         )));
     }
 
+    // Equality against an inlined constant is a scan of fixed-width integers
+    if matches!(op, Op::Equal | Op::NotEqual) && l_v.is_none() && r_v.is_none() {
+        let sides = match (l_s, r_s) {
+            (false, true) => Some((l, r, &l_nulls, &r_nulls)),
+            (true, false) => Some((r, l, &r_nulls, &l_nulls)),
+            _ => None,
+        };
+        // A null constant makes every row null, which this path cannot express
+        if let Some((values, scalar, values_nulls, scalar_nulls)) = sides
+            && scalar_nulls.as_ref().is_none_or(|n| n.null_count() == 0)
+            && let Some(mask) = eq_inline_scalar(values, scalar, l_t, matches!(op, Op::NotEqual))
+        {
+            let nulls = values_nulls.clone().filter(|n| n.null_count() > 0);
+            return Ok(BooleanArray::new(mask, nulls));
+        }
+    }
+
     // Defer computation as may not be necessary
     let values = || -> BooleanBuffer {
         let d = downcast_primitive_array! {
@@ -323,6 +340,71 @@ fn compare_op(op: Op, lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, 
         }
         // Neither side is nullable
         (None, _, None, _) => BooleanArray::new(values(), None),
+    })
+}
+
+/// Compare every value of a byte-view array against one constant, when that
+/// constant is short enough to live inside a view.
+///
+/// Then "equals the constant" is exactly "has the constant's view", so the
+/// whole column is a scan of `u128`s against a fixed one: no buffer is read, no
+/// scalar is re-resolved, and the loop is branch-free enough to vectorize.
+/// Returns `None` for anything else, which falls through to the generic path.
+fn eq_inline_scalar(
+    l: &dyn Array,
+    r: &dyn Array,
+    data_type: &arrow_schema::DataType,
+    negate: bool,
+) -> Option<BooleanBuffer> {
+    let (values, needle) = match data_type {
+        arrow_schema::DataType::Utf8View => {
+            let r = r.as_string_view();
+            (l.as_string_view().views(), *r.views().first()?)
+        }
+        arrow_schema::DataType::BinaryView => {
+            let r = r.as_binary_view();
+            (l.as_binary_view().views(), *r.views().first()?)
+        }
+        _ => return None,
+    };
+    let needle_len = needle as u32;
+    if needle_len > MAX_INLINE_LEN {
+        return None;
+    }
+    // Compare the length and the constant's own bytes, and nothing else: a
+    // value of any other length fails on the length alone, and an inlined
+    // view's remaining bytes are padding a producer need not zero.
+    //
+    // Width matters as much as masking. The bytes that decide it span the low
+    // 4, 8 or 16 of the view, and comparing 16 where 4 would do costs real
+    // time - a u128 is two registers - so each case uses the narrowest integer
+    // that covers the constant. The empty constant lands on the first, where
+    // the test is exactly "is the length zero".
+    let len = values.len();
+    Some(if needle_len <= 4 {
+        // Length and the constant's bytes both fit in the view's low half.
+        let bits = 32 + needle_len * 8;
+        let significant = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let needle = needle as u64 & significant;
+        collect_bool(len, negate, |idx| {
+            // # Safety
+            // The index is within bounds as `len` is `values.len()`
+            let view = unsafe { *values.get_unchecked(idx) };
+            view as u64 & significant == needle
+        })
+    } else {
+        let significant = inline_mask(needle_len);
+        let needle = needle & significant;
+        collect_bool(len, negate, |idx| {
+            // # Safety
+            // The index is within bounds as `len` is `values.len()`
+            let view = unsafe { *values.get_unchecked(idx) };
+            view & significant == needle
+        })
     })
 }
 
@@ -477,6 +559,22 @@ fn apply_op_vectored<T: ArrayOrd>(
         let r_idx = *r_v.get_unchecked(idx);
         op(l.value_unchecked(l_idx), r.value_unchecked(r_idx))
     })
+}
+
+/// Longest value a byte view stores inside itself rather than in a buffer.
+const MAX_INLINE_LEN: u32 = 12;
+
+/// Mask over the part of an inlined view that carries meaning: its length, plus
+/// exactly `len` bytes of data. The remaining inline bytes are padding, which a
+/// producer may leave as anything, so they must not take part in a comparison.
+#[inline(always)]
+fn inline_mask(len: u32) -> u128 {
+    let bits = 32 + len * 8;
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
 }
 
 trait ArrayOrd {
@@ -984,6 +1082,41 @@ mod tests {
             eq(&a, &b).unwrap(),
             BooleanArray::from(vec![Some(false), Some(true)])
         );
+    }
+
+    /// A NULL row compares NULL whichever side it is on, and a null row's view
+    /// is arbitrary, so the answer must come from validity rather than bytes.
+    /// The constant may sit on either side; equality is symmetric
+    #[test]
+    fn test_byte_view_eq_scalar_either_side() {
+        let a =
+            arrow_array::StringViewArray::from(vec![Some(""), Some("xxxx"), Some("xxxxxxxxxxxxx")]);
+        let scalar = Scalar::new(arrow_array::StringViewArray::from(vec!["xxxx"]));
+
+        assert_eq!(eq(&a, &scalar).unwrap(), eq(&scalar, &a).unwrap());
+        assert_eq!(eq(&a, &scalar).unwrap().true_count(), 1);
+    }
+
+    #[test]
+    fn test_byte_view_eq_null_row() {
+        let a = arrow_array::StringViewArray::from(vec![Some(""), Some("x"), None]);
+        let needle = arrow_array::StringViewArray::from(vec![""]);
+        let r = neq(&a, &Scalar::new(&needle)).unwrap();
+        assert_eq!(r.len(), 3);
+        assert!(!r.value(0));
+        assert!(r.value(1));
+        assert!(r.is_null(2), "a null row stays null, got {r:?}");
+    }
+
+    /// A NULL constant makes every comparison NULL, whatever the values are.
+    /// The inline-scalar path must not answer this one from the views.
+    #[test]
+    fn test_byte_view_eq_null_scalar() {
+        let a = arrow_array::StringViewArray::from(vec![Some(""), Some("x"), None]);
+        let needle = arrow_array::StringViewArray::new_null(1);
+        let r = neq(&a, &Scalar::new(&needle)).unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r.null_count(), 3, "every row must be NULL, got {r:?}");
     }
 
     #[test]
