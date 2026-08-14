@@ -381,32 +381,24 @@ fn eq_inline_scalar(
     // that covers the constant. The empty constant lands on the first, where
     // the test is exactly "is the length zero".
     let len = values.len();
-    Some(match needle_len {
-        0 => collect_bool(len, negate, |idx| {
-            // Safety: `idx` is bounded by the length `collect_bool` was given.
-            unsafe { *values.get_unchecked(idx) as u32 == 0 }
-        }),
-        1..=4 => {
-            // A four-byte constant spans the whole low half, where the shift
-            // that would build the mask is exactly the width of the type.
-            let bits = 32 + needle_len * 8;
-            let significant = if bits >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << bits) - 1
-            };
-            let needle = needle as u64 & significant;
-            collect_bool(len, negate, |idx| unsafe {
-                *values.get_unchecked(idx) as u64 & significant == needle
-            })
-        }
-        _ => {
-            let significant = inline_mask(needle_len);
-            let needle = needle & significant;
-            collect_bool(len, negate, |idx| unsafe {
-                *values.get_unchecked(idx) & significant == needle
-            })
-        }
+    Some(if needle_len <= 4 {
+        // Length and the constant's bytes both fit in the view's low half.
+        let bits = 32 + needle_len * 8;
+        let significant = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let needle = needle as u64 & significant;
+        collect_bool(len, negate, |idx| unsafe {
+            *values.get_unchecked(idx) as u64 & significant == needle
+        })
+    } else {
+        let significant = inline_mask(needle_len);
+        let needle = needle & significant;
+        collect_bool(len, negate, |idx| unsafe {
+            *values.get_unchecked(idx) & significant == needle
+        })
     })
 }
 
