@@ -203,6 +203,34 @@ fn shredded_get_path(
         };
     }
 
+    // Each row of a shredded object field may use either `value` or
+    // `typed_value`. The field is present if either slot is valid, so their
+    // validity bitmaps are ORed below. If both slots are null, the field is
+    // missing and the returned Variant row must be Arrow null. An explicit JSON
+    // null remains present because its `value` slot contains the Variant null
+    // primitive. A concrete typed output maps both cases to Arrow null, so only
+    // a Variant result needs this distinction.
+    if as_field.is_none() && path_index > 0 {
+        let missing_value_nulls = match (
+            shredding_state.value_field(),
+            shredding_state.typed_value_field(),
+        ) {
+            (None, None) => Some(arrow::buffer::NullBuffer::new_null(input.len())),
+            (Some(value), None) => value.nulls().cloned(),
+            (None, Some(typed_value)) => typed_value.nulls().cloned(),
+            (Some(value), Some(typed_value)) => match (value.nulls(), typed_value.nulls()) {
+                (Some(value_nulls), Some(typed_value_nulls)) => Some(
+                    arrow::buffer::NullBuffer::new(value_nulls.inner() | typed_value_nulls.inner()),
+                ),
+                _ => None,
+            },
+        };
+        accumulated_nulls = arrow::buffer::NullBuffer::union(
+            accumulated_nulls.as_ref(),
+            missing_value_nulls.as_ref(),
+        );
+    }
+
     // Path exhausted! Create a new `VariantArray` for the location we landed on.
     let target = make_target_variant(
         shredding_state.value_field().cloned(),
@@ -343,7 +371,9 @@ mod test {
 
     use super::{GetOptions, variant_get};
     use crate::variant_array::{ShreddedVariantFieldArray, StructArrayBuilder};
-    use crate::{VariantArray, VariantArrayBuilder, json_to_variant, shred_variant};
+    use crate::{
+        ShreddedSchemaBuilder, VariantArray, VariantArrayBuilder, json_to_variant, shred_variant,
+    };
     use arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BinaryViewArray, BooleanArray, Date32Array,
         Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array,
@@ -711,6 +741,32 @@ mod test {
         // Assert
         assert!(result.is_valid(0));
         assert_eq!(result.value(0), Variant::Null);
+    }
+
+    #[test]
+    fn get_missing_shredded_field_without_a_type_returns_arrow_null() {
+        let json: ArrayRef = Arc::new(StringArray::from(vec![
+            r#"{"stat":"UnaryStats"}"#,
+            r#"{"event.name":"document"}"#,
+            r#"{"stat":null}"#,
+        ]));
+        let shredding = ShreddedSchemaBuilder::new()
+            .with_path("stat", &DataType::Int64)
+            .unwrap()
+            .build();
+        let array: ArrayRef = Arc::new(
+            shred_variant(&json_to_variant(&json).unwrap(), &shredding)
+                .unwrap()
+                .into_inner(),
+        );
+        let options = GetOptions::new_with_path(VariantPath::try_from("stat").unwrap());
+
+        let result = variant_get(&array, options).unwrap();
+        let result = VariantArray::try_new(&result).unwrap();
+
+        assert_eq!(result.value(0).as_string(), Some("UnaryStats"));
+        assert!(result.is_null(1));
+        assert_eq!(result.value(2), Variant::Null);
     }
 
     /// Perfect Shredding: extract the typed value as a VariantArray
