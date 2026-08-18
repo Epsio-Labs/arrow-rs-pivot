@@ -144,7 +144,14 @@ fn shredded_get_path(
                     builder.append_null()?;
                 } else if !cast_options.safe {
                     let value = target.try_value(i)?;
-                    builder.append_value(value)?;
+                    // A present Variant null becomes an Arrow null when a
+                    // concrete output type was requested. It is not a failed
+                    // conversion, even when every other failure is strict.
+                    if as_field.is_some() && matches!(value, parquet_variant::Variant::Null) {
+                        builder.append_null()?;
+                    } else {
+                        builder.append_value(value)?;
+                    }
                 } else {
                     let _ = match target.try_value(i) {
                         Ok(v) => builder.append_value(v)?,
@@ -296,6 +303,8 @@ pub struct GetOptions<'a> {
     /// if `as_type` is `Some(type)` the field is returned as the specified type.
     pub as_type: Option<FieldRef>,
     /// Controls the casting behavior (e.g. error vs substituting null on cast error).
+    /// When `as_type` is set, a Variant null is always returned as an Arrow null;
+    /// it is not considered a cast error in strict mode.
     pub cast_options: CastOptions<'a>,
 }
 
@@ -334,7 +343,7 @@ mod test {
 
     use super::{GetOptions, variant_get};
     use crate::variant_array::{ShreddedVariantFieldArray, StructArrayBuilder};
-    use crate::{VariantArray, VariantArrayBuilder, json_to_variant};
+    use crate::{VariantArray, VariantArrayBuilder, json_to_variant, shred_variant};
     use arrow::array::{
         Array, ArrayRef, AsArray, BinaryArray, BinaryViewArray, BooleanArray, Date32Array,
         Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array,
@@ -656,6 +665,52 @@ mod test {
             err.to_string(),
             "Cast error: Failed to extract primitive of type Int32 from variant ShortString(ShortString(\"n/a\")) at path VariantPath([])"
         );
+    }
+
+    #[test]
+    fn get_variant_json_null_as_int32_unsafe_cast_returns_arrow_null() {
+        // Setup
+        let input =
+            VariantArray::from_iter(vec![Some(Variant::from(34_i32)), Some(Variant::Null), None]);
+        let shredded = shred_variant(&input, &DataType::Int32).unwrap();
+        let array: ArrayRef = Arc::new(shredded.into_inner());
+        let options = GetOptions::new()
+            .with_as_type(Some(FieldRef::from(Field::new(
+                "result",
+                DataType::Int32,
+                true,
+            ))))
+            .with_cast_options(CastOptions {
+                safe: false,
+                ..Default::default()
+            });
+
+        // Execute
+        let result = variant_get(&array, options).unwrap();
+
+        // Assert
+        assert_eq!(
+            result.as_primitive::<arrow::datatypes::Int32Type>(),
+            &Int32Array::from(vec![Some(34), None, None,])
+        );
+    }
+
+    #[test]
+    fn get_variant_json_null_without_a_type_remains_a_variant_null() {
+        // Setup
+        let array: ArrayRef = ArrayRef::from(VariantArray::from_iter(vec![Some(Variant::Null)]));
+        let options = GetOptions::new().with_cast_options(CastOptions {
+            safe: false,
+            ..Default::default()
+        });
+
+        // Execute
+        let result = variant_get(&array, options).unwrap();
+        let result = VariantArray::try_new(&result).unwrap();
+
+        // Assert
+        assert!(result.is_valid(0));
+        assert_eq!(result.value(0), Variant::Null);
     }
 
     /// Perfect Shredding: extract the typed value as a VariantArray
