@@ -443,11 +443,61 @@ fn take_bits(v: &dyn AnyDictionaryArray, buffer: BooleanBuffer) -> BooleanBuffer
     array.as_boolean().values().clone()
 }
 
+/// True when this CPU implements every extension `collect_bool_icelake` is
+/// compiled with: the AVX-512 tier of Ice Lake servers and AMD Zen 4 and
+/// later. Keep the list in step with that clone's `#[target_feature]` set.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn supports_icelake_kernels() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512cd")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+            && std::arch::is_x86_feature_detected!("avx512vbmi2")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512bitalg")
+            && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+            && std::arch::is_x86_feature_detected!("bmi1")
+            && std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("lzcnt")
+            && std::arch::is_x86_feature_detected!("movbe")
+            && std::arch::is_x86_feature_detected!("fma")
+    })
+}
+
 /// Invokes `f` with values `0..len` collecting the boolean results into a new `BooleanBuffer`
 ///
 /// This is similar to [`arrow_buffer::MutableBuffer::collect_bool`] but with
 /// the option to efficiently negate the result
 fn collect_bool(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
+    #[cfg(target_arch = "x86_64")]
+    if supports_icelake_kernels() {
+        // SAFETY: the clone requires exactly the extensions
+        // `supports_icelake_kernels` just confirmed this CPU has.
+        return unsafe { collect_bool_icelake(len, neg, f) };
+    }
+    collect_bool_body(len, neg, f)
+}
+
+/// [`collect_bool`] compiled with the Ice Lake tier feature set, so the packed
+/// comparison loop vectorises into mask registers at widths the compile floor
+/// rules out. Keep the feature list in step with `supports_icelake_kernels`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,avx512bitalg,avx512vpopcntdq,bmi1,bmi2,lzcnt,movbe,fma"
+)]
+fn collect_bool_icelake(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
+    collect_bool_body(len, neg, f)
+}
+
+// Forced inline so the wide clone's target features reach the loop; a plain
+// call would compile the body once, at the floor's width, for both callers.
+#[inline(always)]
+fn collect_bool_body(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
     let mut buffer = Vec::with_capacity(ceil(len, 64));
 
     let chunks = len / 64;
