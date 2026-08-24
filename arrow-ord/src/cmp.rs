@@ -469,16 +469,41 @@ fn supports_icelake_kernels() -> bool {
     })
 }
 
+/// True when this CPU implements every extension `collect_bool_v4` is compiled
+/// with: the base AVX-512 set of Skylake-SP and Cascade Lake. Keep the list in
+/// step with that clone's `#[target_feature]` set.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn supports_v4_kernels() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512cd")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("bmi1")
+            && std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("lzcnt")
+            && std::arch::is_x86_feature_detected!("movbe")
+            && std::arch::is_x86_feature_detected!("fma")
+    })
+}
+
 /// Invokes `f` with values `0..len` collecting the boolean results into a new `BooleanBuffer`
 ///
 /// This is similar to [`arrow_buffer::MutableBuffer::collect_bool`] but with
 /// the option to efficiently negate the result
 fn collect_bool(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
     #[cfg(target_arch = "x86_64")]
-    if supports_icelake_kernels() {
-        // SAFETY: the clone requires exactly the extensions
-        // `supports_icelake_kernels` just confirmed this CPU has.
-        return unsafe { collect_bool_icelake(len, neg, f) };
+    {
+        // SAFETY: each feature check covers every feature on its clone.
+        if supports_icelake_kernels() {
+            return unsafe { collect_bool_icelake(len, neg, f) };
+        }
+        if supports_v4_kernels() {
+            return unsafe { collect_bool_v4(len, neg, f) };
+        }
     }
     collect_bool_body(len, neg, f)
 }
@@ -491,6 +516,16 @@ fn collect_bool(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuff
     enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,avx512bitalg,avx512vpopcntdq,bmi1,bmi2,lzcnt,movbe,fma"
 )]
 fn collect_bool_icelake(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
+    collect_bool_body(len, neg, f)
+}
+
+/// [`collect_bool`] compiled with the x86-64-v4 tier feature set (Skylake-SP /
+/// Cascade Lake). Keep the feature list in step with `supports_v4_kernels`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,bmi1,bmi2,lzcnt,movbe,fma"
+)]
+fn collect_bool_v4(len: usize, neg: bool, f: impl Fn(usize) -> bool) -> BooleanBuffer {
     collect_bool_body(len, neg, f)
 }
 
