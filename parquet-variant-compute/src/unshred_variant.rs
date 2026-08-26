@@ -544,11 +544,30 @@ where
     }
 }
 
+/// Dictionary entries per typed field beyond which a row resolves its fields by name lookup
+/// rather than by merging its whole dictionary against the field names.
+///
+/// The merge costs one comparison per dictionary entry plus one per typed field, and afterwards
+/// every field of the row is inserted by id, with no dictionary access at all. That wins when the
+/// dictionary is about the size of the document, which is what a builder writes when the
+/// dictionary comes from the document's own keys. A writer that shares one large dictionary
+/// across many sparse rows inverts that, so past this ratio a row looks its fields up one by one.
+const ENTRIES_PER_FIELD_LIMIT: usize = 4;
+
 /// Builder for unshredding struct/object types with nested fields
 struct StructUnshredVariantBuilder<'a> {
     value: Option<&'a arrow::array::BinaryViewArray>,
     typed_value: &'a arrow::array::StructArray,
     field_unshredders: IndexMap<&'a str, Option<UnshredVariantRowBuilder<'a>>>,
+    /// The typed fields' names as bytes in byte order, each with its position in
+    /// `field_unshredders`: one side of the per-row merge against a dictionary.
+    sorted_fields: Vec<(&'a [u8], usize)>,
+    /// Per row that merges: each typed field's id in the row's dictionary, by position.
+    field_id_of_field: Vec<Option<u32>>,
+    /// Per row that merges: whether a dictionary id names one of the typed fields.
+    is_typed_field_id: Vec<bool>,
+    /// The entries of an unsorted dictionary in byte order, for the merge.
+    dictionary_order: Vec<u32>,
 }
 
 impl<'a> StructUnshredVariantBuilder<'a> {
@@ -566,12 +585,60 @@ impl<'a> StructUnshredVariantBuilder<'a> {
             let field_unshredder = UnshredVariantRowBuilder::try_new_opt(field_array.try_into()?)?;
             field_unshredders.insert(field.name().as_ref(), field_unshredder);
         }
+        let mut sorted_fields: Vec<(&'a [u8], usize)> = field_unshredders
+            .keys()
+            .enumerate()
+            .map(|(position, name): (usize, &&'a str)| (name.as_bytes(), position))
+            .collect();
+        sorted_fields.sort();
 
         Ok(Self {
             value,
             typed_value,
             field_unshredders,
+            sorted_fields,
+            field_id_of_field: Vec::new(),
+            is_typed_field_id: Vec::new(),
+            dictionary_order: Vec::new(),
         })
+    }
+
+    /// Resolve the typed fields' ids in `metadata` by one merge of its entries, in byte order,
+    /// against the sorted field names, filling `field_id_of_field` and `is_typed_field_id`.
+    /// Returns `false`, having filled nothing, for a dictionary too large relative to the typed
+    /// fields for the merge to pay off.
+    fn resolve_field_ids(&mut self, metadata: &VariantMetadata) -> Result<bool> {
+        let entries = metadata.len();
+        let fields = self.sorted_fields.len();
+        if entries > fields.saturating_mul(ENTRIES_PER_FIELD_LIMIT) {
+            return Ok(false);
+        }
+        self.field_id_of_field.clear();
+        self.field_id_of_field.resize(fields, None);
+        self.is_typed_field_id.clear();
+        self.is_typed_field_id.resize(entries, false);
+        self.dictionary_order.clear();
+        self.dictionary_order.extend(0..entries as u32);
+        if !metadata.is_sorted() {
+            self.dictionary_order.sort_unstable_by(|&left, &right| {
+                let left = metadata.name_bytes(left as usize).unwrap_or_default();
+                let right = metadata.name_bytes(right as usize).unwrap_or_default();
+                left.cmp(right)
+            });
+        }
+
+        let mut field = 0;
+        for &field_id in &self.dictionary_order {
+            let name = metadata.name_bytes(field_id as usize)?;
+            while field < fields && self.sorted_fields[field].0 < name {
+                field += 1;
+            }
+            if field < fields && self.sorted_fields[field].0 == name {
+                self.field_id_of_field[self.sorted_fields[field].1] = Some(field_id);
+                self.is_typed_field_id[field_id as usize] = true;
+            }
+        }
+        Ok(true)
     }
 
     fn append_row(
@@ -585,10 +652,21 @@ impl<'a> StructUnshredVariantBuilder<'a> {
         // If we get here, typed_value is valid and value may or may not be valid
         let mut object_builder = builder.try_new_object()?;
 
+        // Fields the merge resolved are inserted by id; any it did not (it was skipped for this
+        // row, or a typed field's name is missing from this row's dictionary) go by name.
+        let merged = self.resolve_field_ids(metadata)?;
+
         // Process typed fields (skip empty builders that indicate missing fields)
-        for (field_name, field_unshredder_opt) in &mut self.field_unshredders {
+        for (position, (field_name, field_unshredder_opt)) in
+            self.field_unshredders.iter_mut().enumerate()
+        {
             if let Some(field_unshredder) = field_unshredder_opt {
-                let mut field_builder = ObjectFieldBuilder::new(field_name, &mut object_builder);
+                let mut field_builder = match self.field_id_of_field.get(position) {
+                    Some(&Some(field_id)) if merged => {
+                        ObjectFieldBuilder::with_field_id(field_id, &mut object_builder)
+                    }
+                    _ => ObjectFieldBuilder::new(field_name, &mut object_builder),
+                };
                 field_unshredder.append_row(&mut field_builder, metadata, index)?;
             }
         }
@@ -601,13 +679,23 @@ impl<'a> StructUnshredVariantBuilder<'a> {
                 ));
             };
 
-            for (field_name, field_value) in object.iter() {
-                if self.field_unshredders.contains_key(field_name) {
+            for (field_id, field_value) in object.iter_with_field_ids() {
+                let is_typed = if merged {
+                    self.is_typed_field_id
+                        .get(field_id as usize)
+                        .copied()
+                        .unwrap_or(false)
+                } else {
+                    self.field_unshredders
+                        .contains_key(metadata.get(field_id as usize)?)
+                };
+                if is_typed {
                     return Err(ArrowError::InvalidArgumentError(format!(
-                        "Field '{field_name}' appears in both typed_value and value",
+                        "Field '{}' appears in both typed_value and value",
+                        metadata.get(field_id as usize)?
                     )));
                 }
-                object_builder.insert_bytes(field_name, field_value);
+                object_builder.insert_bytes_by_field_id(field_id, field_value);
             }
         }
 
@@ -675,8 +763,84 @@ impl<'a, L: ListLikeArray> ListUnshredVariantBuilder<'a, L> {
 #[cfg(test)]
 mod tests {
     use crate::VariantArray;
-    use arrow::array::{BinaryViewArray, LargeStringArray, StringViewArray};
-    use parquet_variant::Variant;
+    use arrow::array::{Array, BinaryViewArray, LargeStringArray, StringViewArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields};
+    use parquet_variant::{Variant, VariantBuilder};
+    use std::sync::Arc;
+
+    /// A variant column of documents `{a: 1, b: "two", zz: 3}` whose dictionaries are
+    /// pre-seeded with `seeded` names in the order given, so a test controls each row's
+    /// dictionary: which names it holds, how many, and whether they are sorted.
+    fn documents_with_seeded_dictionary(seeded: &[&str], rows: usize) -> VariantArray {
+        let built: Vec<(Vec<u8>, Vec<u8>)> = (0..rows)
+            .map(|_| {
+                let mut builder = VariantBuilder::new().with_field_names(seeded.iter().copied());
+                let mut object = builder.new_object();
+                object.insert("a", 1i64);
+                object.insert("b", "two");
+                object.insert("zz", 3i64);
+                object.finish();
+                builder.finish()
+            })
+            .collect();
+        let metadata: arrow::array::ArrayRef = Arc::new(BinaryViewArray::from_iter_values(
+            built.iter().map(|(metadata, _)| metadata.as_slice()),
+        ));
+        let value: arrow::array::ArrayRef = Arc::new(BinaryViewArray::from_iter_values(
+            built.iter().map(|(_, value)| value.as_slice()),
+        ));
+        let fields = Fields::from(vec![
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::BinaryView, true),
+        ]);
+        VariantArray::try_new(&StructArray::try_new(fields, vec![metadata, value], None).unwrap())
+            .unwrap()
+    }
+
+    /// Shredding `a` and `b` and unshredding again gives back the documents, whatever the
+    /// shape of their dictionaries: the fields are re-inserted by dictionary id, resolved by
+    /// merging a sorted dictionary or a sorted permutation of an unsorted one, or looked up by
+    /// name when the dictionary is far larger than the shredded fields.
+    fn assert_shred_round_trips(seeded: &[&str]) {
+        let documents = documents_with_seeded_dictionary(seeded, 2);
+        let shredding = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8View, true),
+        ]));
+        let shredded = crate::shred_variant(&documents, &shredding).unwrap();
+
+        let unshredded = crate::unshred_variant(&shredded).unwrap();
+
+        assert_eq!(unshredded.len(), documents.len());
+        for row in 0..documents.len() {
+            assert_eq!(unshredded.value(row), documents.value(row));
+            assert_eq!(
+                unshredded.metadata_field().value(row),
+                documents.metadata_field().value(row)
+            );
+        }
+    }
+
+    #[test]
+    fn unshred_restores_documents_with_a_sorted_dictionary() {
+        assert_shred_round_trips(&[]);
+    }
+
+    #[test]
+    fn unshred_restores_documents_with_an_unsorted_dictionary() {
+        let documents = documents_with_seeded_dictionary(&["zz", "b"], 1);
+        assert!(!documents.value(0).metadata().is_sorted());
+
+        assert_shred_round_trips(&["zz", "b"]);
+    }
+
+    #[test]
+    fn unshred_restores_sparse_documents_over_an_oversized_dictionary() {
+        let seeded: Vec<String> = (0..64).map(|i| format!("unused_{i:02}")).collect();
+        let seeded: Vec<&str> = seeded.iter().map(String::as_str).collect();
+
+        assert_shred_round_trips(&seeded);
+    }
 
     #[test]
     fn test_unshred_utf8view_typed_value() {

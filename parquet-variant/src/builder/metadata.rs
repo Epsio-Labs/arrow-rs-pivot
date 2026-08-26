@@ -43,6 +43,18 @@ pub trait MetadataBuilder: std::fmt::Debug {
     /// [`Self::num_field_names`]. Panics if the field id is out of bounds.
     fn field_name(&self, field_id: usize) -> &str;
 
+    /// The bytes of the field name for a given field id, for callers that only compare names:
+    /// byte equality is string equality and byte order is the dictionary's sort order.
+    fn field_name_bytes(&self, field_id: usize) -> &[u8] {
+        self.field_name(field_id).as_bytes()
+    }
+
+    /// Whether field ids are assigned in the order of their names, so that sorting fields by
+    /// id sorts them by name.
+    fn is_sorted(&self) -> bool {
+        false
+    }
+
     /// Returns the number of field names stored in this metadata builder. Any number less than this
     /// is a valid field id. The builder can be reverted back to this size later on (discarding any
     /// newer/higher field ids) by calling [`Self::truncate_field_names`].
@@ -61,6 +73,9 @@ impl MetadataBuilder for WritableMetadataBuilder {
     }
     fn field_name(&self, field_id: usize) -> &str {
         self.field_name(field_id)
+    }
+    fn is_sorted(&self) -> bool {
+        self.is_sorted
     }
     fn num_field_names(&self) -> usize {
         self.num_field_names()
@@ -116,6 +131,14 @@ impl MetadataBuilder for ReadOnlyMetadataBuilder<'_> {
     }
     fn field_name(&self, field_id: usize) -> &str {
         &self.metadata[field_id]
+    }
+    fn field_name_bytes(&self, field_id: usize) -> &[u8] {
+        self.metadata
+            .name_bytes(field_id)
+            .expect("Invalid metadata dictionary entry")
+    }
+    fn is_sorted(&self) -> bool {
+        self.metadata.is_sorted()
     }
     fn num_field_names(&self) -> usize {
         self.metadata.len()

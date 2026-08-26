@@ -163,6 +163,37 @@ impl<'a, S: BuilderSpecificState> ObjectBuilder<'a, S> {
         Ok(())
     }
 
+    /// Add a field by its id in the metadata dictionary, copying raw bytes when possible, as
+    /// [`ObjectBuilder::insert_bytes`] does. The caller has already resolved the name to `field_id`,
+    /// so no dictionary lookup happens here.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the id duplicates an existing field when validation is enabled.
+    pub fn insert_bytes_by_field_id<'m, 'd>(
+        &mut self,
+        field_id: u32,
+        value: impl Into<Variant<'m, 'd>>,
+    ) {
+        let (state, _) = self.parent_state_by_key(FieldKey::Id(field_id)).unwrap();
+        ValueBuilder::append_variant_bytes(state, value.into());
+    }
+
+    /// Add a field by its id in the metadata dictionary; see [`ObjectBuilder::insert`] for the
+    /// name-keyed equivalent.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the id duplicates an existing field when validation is enabled.
+    pub fn insert_by_field_id<'m, 'd, T: Into<Variant<'m, 'd>>>(
+        &mut self,
+        field_id: u32,
+        value: T,
+    ) {
+        let (state, _) = self.parent_state_by_key(FieldKey::Id(field_id)).unwrap();
+        ValueBuilder::append_variant(state, value.into())
+    }
+
     /// Builder style API for adding a field with key and value to the object
     ///
     /// Same as [`ObjectBuilder::insert`], but returns `self` for chaining.
@@ -197,16 +228,56 @@ impl<'a, S: BuilderSpecificState> ObjectBuilder<'a, S> {
         &'b mut self,
         field_name: &str,
     ) -> Result<(ParentState<'b, ObjectState<'b>>, bool), ArrowError> {
+        self.parent_state_by_key(FieldKey::Name(field_name))
+    }
+
+    // As `parent_state`, for a field named either way.
+    fn parent_state_by_key<'b>(
+        &'b mut self,
+        key: FieldKey<'_>,
+    ) -> Result<(ParentState<'b, ObjectState<'b>>, bool), ArrowError> {
         let validate_unique_fields = self.validate_unique_fields;
-        let state = ParentState::try_object(
-            self.parent_state.value_builder,
-            self.parent_state.metadata_builder,
-            &mut self.fields,
-            self.parent_state.saved_value_builder_offset,
-            field_name,
-            validate_unique_fields,
-        )?;
+        let state = match key {
+            FieldKey::Name(field_name) => ParentState::try_object(
+                self.parent_state.value_builder,
+                self.parent_state.metadata_builder,
+                &mut self.fields,
+                self.parent_state.saved_value_builder_offset,
+                field_name,
+                validate_unique_fields,
+            )?,
+            FieldKey::Id(field_id) => ParentState::try_object_with_field_id(
+                self.parent_state.value_builder,
+                self.parent_state.metadata_builder,
+                &mut self.fields,
+                self.parent_state.saved_value_builder_offset,
+                field_id,
+                validate_unique_fields,
+            )?,
+        };
         Ok((state, validate_unique_fields))
+    }
+
+    /// Returns an object builder for a new (nested) object under the field with id `field_id`;
+    /// see [`ObjectBuilder::try_new_object`] for the name-keyed equivalent.
+    pub fn try_new_object_by_field_id<'b>(
+        &'b mut self,
+        field_id: u32,
+    ) -> Result<ObjectBuilder<'b, ObjectState<'b>>, ArrowError> {
+        let (parent_state, validate_unique_fields) =
+            self.parent_state_by_key(FieldKey::Id(field_id))?;
+        Ok(ObjectBuilder::new(parent_state, validate_unique_fields))
+    }
+
+    /// Returns a list builder for a new (nested) list under the field with id `field_id`; see
+    /// [`ObjectBuilder::try_new_list`] for the name-keyed equivalent.
+    pub fn try_new_list_by_field_id<'b>(
+        &'b mut self,
+        field_id: u32,
+    ) -> Result<ListBuilder<'b, ObjectState<'b>>, ArrowError> {
+        let (parent_state, validate_unique_fields) =
+            self.parent_state_by_key(FieldKey::Id(field_id))?;
+        Ok(ListBuilder::new(parent_state, validate_unique_fields))
     }
 
     /// Returns an object builder that can be used to append a new (nested) object to this object.
@@ -257,11 +328,18 @@ impl<'a, S: BuilderSpecificState> ObjectBuilder<'a, S> {
     pub fn finish(mut self) {
         let metadata_builder = self.parent_state.metadata_builder();
 
-        self.fields.sort_by(|&field_a_id, _, &field_b_id, _| {
-            let field_a_name = metadata_builder.field_name(field_a_id as usize);
-            let field_b_name = metadata_builder.field_name(field_b_id as usize);
-            field_a_name.cmp(field_b_name)
-        });
+        // The spec orders an object's fields by name. A sorted dictionary assigns ids in name
+        // order, so comparing ids is comparing names without touching the dictionary.
+        if metadata_builder.is_sorted() {
+            self.fields
+                .sort_by(|&field_a_id, _, &field_b_id, _| field_a_id.cmp(&field_b_id));
+        } else {
+            self.fields.sort_by(|&field_a_id, _, &field_b_id, _| {
+                let field_a_name = metadata_builder.field_name_bytes(field_a_id as usize);
+                let field_b_name = metadata_builder.field_name_bytes(field_b_id as usize);
+                field_a_name.cmp(field_b_name)
+            });
+        }
 
         let max_id = self.fields.iter().map(|(i, _)| *i).max().unwrap_or(0);
         let id_size = int_size(max_id as usize);
@@ -368,14 +446,60 @@ impl<'a> ParentState<'a, ObjectState<'a>> {
         // The saved_parent_buffer_offset is the buffer size as of when the parent builder was
         // constructed. The saved_buffer_offset is the buffer size as of now (when a child builder
         // is created). The variant field_offset entry for this field is their difference.
-        let saved_value_builder_offset = value_builder.offset();
-        let saved_fields_size = fields.len();
         let saved_metadata_builder_dict_size = metadata_builder.num_field_names();
         let field_id = metadata_builder.try_upsert_field_name(field_name)?;
+        Self::try_object_resolved(
+            value_builder,
+            metadata_builder,
+            fields,
+            saved_parent_value_builder_offset,
+            field_id,
+            saved_metadata_builder_dict_size,
+            validate_unique_fields,
+        )
+    }
+
+    /// As [`Self::try_object`], for a field the caller has already resolved to its id in the
+    /// metadata dictionary, so no name is looked up or registered.
+    pub fn try_object_with_field_id(
+        value_builder: &'a mut ValueBuilder,
+        metadata_builder: &'a mut dyn MetadataBuilder,
+        fields: &'a mut IndexMap<u32, usize>,
+        saved_parent_value_builder_offset: usize,
+        field_id: u32,
+        validate_unique_fields: bool,
+    ) -> Result<Self, ArrowError> {
+        let saved_metadata_builder_dict_size = metadata_builder.num_field_names();
+        Self::try_object_resolved(
+            value_builder,
+            metadata_builder,
+            fields,
+            saved_parent_value_builder_offset,
+            field_id,
+            saved_metadata_builder_dict_size,
+            validate_unique_fields,
+        )
+    }
+
+    fn try_object_resolved(
+        value_builder: &'a mut ValueBuilder,
+        metadata_builder: &'a mut dyn MetadataBuilder,
+        fields: &'a mut IndexMap<u32, usize>,
+        saved_parent_value_builder_offset: usize,
+        field_id: u32,
+        saved_metadata_builder_dict_size: usize,
+        validate_unique_fields: bool,
+    ) -> Result<Self, ArrowError> {
+        // The saved_parent_buffer_offset is the buffer size as of when the parent builder was
+        // constructed. The saved_buffer_offset is the buffer size as of now (when a child builder
+        // is created). The variant field_offset entry for this field is their difference.
+        let saved_value_builder_offset = value_builder.offset();
+        let saved_fields_size = fields.len();
         let field_start = saved_value_builder_offset - saved_parent_value_builder_offset;
         if fields.insert(field_id, field_start).is_some() && validate_unique_fields {
             return Err(ArrowError::InvalidArgumentError(format!(
-                "Duplicate field name: {field_name}"
+                "Duplicate field name: {}",
+                metadata_builder.field_name(field_id as usize)
             )));
         }
 
@@ -394,15 +518,34 @@ impl<'a> ParentState<'a, ObjectState<'a>> {
     }
 }
 
+/// How a field of an object is named: by its name, resolved against the metadata dictionary
+/// when the field is inserted, or by a dictionary id the caller has already resolved.
+#[derive(Clone, Copy, Debug)]
+pub enum FieldKey<'s> {
+    Name(&'s str),
+    Id(u32),
+}
+
 /// A [`VariantBuilderExt`] that inserts a new field into a variant object.
 pub struct ObjectFieldBuilder<'o, 'v, 's, S: BuilderSpecificState> {
-    key: &'s str,
+    key: FieldKey<'s>,
     builder: &'o mut ObjectBuilder<'v, S>,
 }
 
 impl<'o, 'v, 's, S: BuilderSpecificState> ObjectFieldBuilder<'o, 'v, 's, S> {
     pub fn new(key: &'s str, builder: &'o mut ObjectBuilder<'v, S>) -> Self {
-        Self { key, builder }
+        Self {
+            key: FieldKey::Name(key),
+            builder,
+        }
+    }
+
+    /// A builder for the field with id `field_id` in the metadata dictionary.
+    pub fn with_field_id(field_id: u32, builder: &'o mut ObjectBuilder<'v, S>) -> Self {
+        Self {
+            key: FieldKey::Id(field_id),
+            builder,
+        }
     }
 }
 
@@ -415,15 +558,24 @@ impl<S: BuilderSpecificState> VariantBuilderExt for ObjectFieldBuilder<'_, '_, '
     /// A NULL object field is interpreted as missing, so nothing gets inserted at all.
     fn append_null(&mut self) {}
     fn append_value<'m, 'v>(&mut self, value: impl Into<Variant<'m, 'v>>) {
-        self.builder.insert(self.key, value);
+        match self.key {
+            FieldKey::Name(key) => self.builder.insert(key, value),
+            FieldKey::Id(field_id) => self.builder.insert_by_field_id(field_id, value),
+        }
     }
 
     fn try_new_list(&mut self) -> Result<ListBuilder<'_, Self::State<'_>>, ArrowError> {
-        self.builder.try_new_list(self.key)
+        match self.key {
+            FieldKey::Name(key) => self.builder.try_new_list(key),
+            FieldKey::Id(field_id) => self.builder.try_new_list_by_field_id(field_id),
+        }
     }
 
     fn try_new_object(&mut self) -> Result<ObjectBuilder<'_, Self::State<'_>>, ArrowError> {
-        self.builder.try_new_object(self.key)
+        match self.key {
+            FieldKey::Name(key) => self.builder.try_new_object(key),
+            FieldKey::Id(field_id) => self.builder.try_new_object_by_field_id(field_id),
+        }
     }
 }
 
