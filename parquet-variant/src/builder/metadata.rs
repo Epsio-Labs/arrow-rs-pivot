@@ -18,9 +18,9 @@
 use std::collections::HashMap;
 
 use arrow_schema::ArrowError;
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 
-use crate::{VariantMetadata, int_size};
+use crate::{DictionaryOrder, VariantMetadata, int_size};
 
 /// Write little-endian integer to buffer
 fn write_offset(buf: &mut Vec<u8>, value: usize, nbytes: u8) {
@@ -53,6 +53,25 @@ pub trait MetadataBuilder: std::fmt::Debug {
     /// id sorts them by name.
     fn is_sorted(&self) -> bool {
         false
+    }
+
+    /// Put `fields`, an object's `(field id, offset)` entries, in the byte order of the fields'
+    /// names, which is the order the format stores them in. Ids already in name order need no
+    /// names at all; otherwise the names are fetched once each and sorted.
+    fn sort_fields_by_name(&mut self, fields: &mut IndexMap<u32, usize>) {
+        if self.is_sorted() {
+            fields.sort_by(|&left, _, &right, _| left.cmp(&right));
+            return;
+        }
+        let mut entries: Vec<(&[u8], u32, usize)> = fields
+            .iter()
+            .map(|(&id, &offset)| (self.field_name_bytes(id as usize), id, offset))
+            .collect();
+        entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        *fields = entries
+            .into_iter()
+            .map(|(_, id, offset)| (id, offset))
+            .collect();
     }
 
     /// Returns the number of field names stored in this metadata builder. Any number less than this
@@ -102,6 +121,9 @@ pub struct ReadOnlyMetadataBuilder<'m> {
     // A cache that tracks field names this builder has already seen, because finding the field id
     // for a given field name is expensive -- O(n) for a large and unsorted metadata dictionary.
     known_field_names: HashMap<&'m str, u32>,
+    // The dictionary's name order, built the first time an object's fields need sorting and
+    // reused for every object built against this dictionary.
+    order: Option<DictionaryOrder<'m>>,
 }
 
 impl<'m> ReadOnlyMetadataBuilder<'m> {
@@ -110,6 +132,7 @@ impl<'m> ReadOnlyMetadataBuilder<'m> {
         Self {
             metadata,
             known_field_names: HashMap::new(),
+            order: None,
         }
     }
 }
@@ -139,6 +162,18 @@ impl MetadataBuilder for ReadOnlyMetadataBuilder<'_> {
     }
     fn is_sorted(&self) -> bool {
         self.metadata.is_sorted()
+    }
+    fn sort_fields_by_name(&mut self, fields: &mut IndexMap<u32, usize>) {
+        if self.metadata.is_sorted() {
+            fields.sort_by(|&left, _, &right, _| left.cmp(&right));
+            return;
+        }
+        let order = self.order.get_or_insert_with(|| {
+            self.metadata
+                .dictionary_order()
+                .expect("Invalid metadata dictionary")
+        });
+        fields.sort_by(|&left, _, &right, _| order.rank(left).cmp(&order.rank(right)));
     }
     fn num_field_names(&self) -> usize {
         self.metadata.len()

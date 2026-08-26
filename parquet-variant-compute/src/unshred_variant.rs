@@ -566,8 +566,6 @@ struct StructUnshredVariantBuilder<'a> {
     field_id_of_field: Vec<Option<u32>>,
     /// Per row that merges: whether a dictionary id names one of the typed fields.
     is_typed_field_id: Vec<bool>,
-    /// The entries of an unsorted dictionary in byte order, for the merge.
-    dictionary_order: Vec<u32>,
 }
 
 impl<'a> StructUnshredVariantBuilder<'a> {
@@ -599,7 +597,6 @@ impl<'a> StructUnshredVariantBuilder<'a> {
             sorted_fields,
             field_id_of_field: Vec::new(),
             is_typed_field_id: Vec::new(),
-            dictionary_order: Vec::new(),
         })
     }
 
@@ -617,19 +614,11 @@ impl<'a> StructUnshredVariantBuilder<'a> {
         self.field_id_of_field.resize(fields, None);
         self.is_typed_field_id.clear();
         self.is_typed_field_id.resize(entries, false);
-        self.dictionary_order.clear();
-        self.dictionary_order.extend(0..entries as u32);
-        if !metadata.is_sorted() {
-            self.dictionary_order.sort_unstable_by(|&left, &right| {
-                let left = metadata.name_bytes(left as usize).unwrap_or_default();
-                let right = metadata.name_bytes(right as usize).unwrap_or_default();
-                left.cmp(right)
-            });
-        }
+        let order = metadata.dictionary_order()?;
 
         let mut field = 0;
-        for &field_id in &self.dictionary_order {
-            let name = metadata.name_bytes(field_id as usize)?;
+        for &field_id in order.ids_by_name() {
+            let name = order.name(field_id);
             while field < fields && self.sorted_fields[field].0 < name {
                 field += 1;
             }

@@ -328,18 +328,8 @@ impl<'a, S: BuilderSpecificState> ObjectBuilder<'a, S> {
     pub fn finish(mut self) {
         let metadata_builder = self.parent_state.metadata_builder();
 
-        // The spec orders an object's fields by name. A sorted dictionary assigns ids in name
-        // order, so comparing ids is comparing names without touching the dictionary.
-        if metadata_builder.is_sorted() {
-            self.fields
-                .sort_by(|&field_a_id, _, &field_b_id, _| field_a_id.cmp(&field_b_id));
-        } else {
-            self.fields.sort_by(|&field_a_id, _, &field_b_id, _| {
-                let field_a_name = metadata_builder.field_name_bytes(field_a_id as usize);
-                let field_b_name = metadata_builder.field_name_bytes(field_b_id as usize);
-                field_a_name.cmp(field_b_name)
-            });
-        }
+        // The spec orders an object's fields by name.
+        metadata_builder.sort_fields_by_name(&mut self.fields);
 
         let max_id = self.fields.iter().map(|(i, _)| *i).max().unwrap_or(0);
         let id_size = int_size(max_id as usize);

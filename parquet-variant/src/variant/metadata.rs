@@ -175,6 +175,76 @@ pub const EMPTY_VARIANT_METADATA: VariantMetadata = VariantMetadata {
     validated: true,
 };
 
+/// A metadata dictionary's entries in byte order: each entry's name bytes, the entry ids
+/// sorted by name, and each id's rank in that order. Built once per dictionary so that a
+/// caller working on a document's fields by id (matching them against a sorted list of names,
+/// or ordering them by name) does no per-field dictionary decoding. For a dictionary whose
+/// header says it is sorted, the order is the identity and nothing is sorted.
+#[derive(Clone, Debug)]
+pub struct DictionaryOrder<'m> {
+    names: Vec<&'m [u8]>,
+    ids_by_name: Vec<u32>,
+    rank_by_id: Vec<u32>,
+}
+
+impl<'m> DictionaryOrder<'m> {
+    fn try_new(metadata: &VariantMetadata<'m>) -> Result<Self, ArrowError> {
+        let len = metadata.len();
+        let mut names = Vec::with_capacity(len);
+        // Walk the offsets once: each entry ends where the next begins.
+        let mut start = metadata.get_offset(0)? as usize;
+        for i in 0..len {
+            let end = metadata.get_offset(i + 1)? as usize;
+            names.push(slice_from_slice_at_offset(
+                metadata.bytes,
+                metadata.first_value_byte as _,
+                start..end,
+            )?);
+            start = end;
+        }
+        let mut ids_by_name: Vec<u32> = (0..len as u32).collect();
+        if !metadata.is_sorted() {
+            ids_by_name
+                .sort_unstable_by(|&left, &right| names[left as usize].cmp(names[right as usize]));
+        }
+        let mut rank_by_id = vec![0u32; len];
+        for (rank, &id) in ids_by_name.iter().enumerate() {
+            rank_by_id[id as usize] = rank as u32;
+        }
+        Ok(Self {
+            names,
+            ids_by_name,
+            rank_by_id,
+        })
+    }
+
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// True if the dictionary has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// The name bytes of entry `id`. Panics if out of bounds.
+    pub fn name(&self, id: u32) -> &'m [u8] {
+        self.names[id as usize]
+    }
+
+    /// The entry ids in byte order of their names.
+    pub fn ids_by_name(&self) -> &[u32] {
+        &self.ids_by_name
+    }
+
+    /// The position of entry `id` in [`Self::ids_by_name`]: comparing ranks compares names.
+    /// Panics if out of bounds.
+    pub fn rank(&self, id: u32) -> u32 {
+        self.rank_by_id[id as usize]
+    }
+}
+
 impl<'m> VariantMetadata<'m> {
     /// Attempts to interpret `bytes` as a variant metadata instance, with full [validation] of all
     /// dictionary entries.
@@ -367,6 +437,13 @@ impl<'m> VariantMetadata<'m> {
     pub fn name_bytes(&self, i: usize) -> Result<&'m [u8], ArrowError> {
         let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
         slice_from_slice_at_offset(self.bytes, self.first_value_byte as _, byte_range)
+    }
+
+    /// The dictionary's entries in byte order, computed once. A caller that routes a
+    /// document's fields by id, or orders fields by name, can then do so without touching the
+    /// dictionary again; see [`DictionaryOrder`].
+    pub fn dictionary_order(&self) -> Result<DictionaryOrder<'m>, ArrowError> {
+        DictionaryOrder::try_new(self)
     }
 
     // Helper method used by our `impl Index` and also by `get_entry`. Panics if the underlying
