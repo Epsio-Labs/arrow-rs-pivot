@@ -355,16 +355,49 @@ impl<'m, 'v> VariantObject<'m, 'v> {
 
     /// Fallible version of `field_name`. Returns field name by index, capturing validation errors
     fn try_field_name(&self, i: usize) -> Result<&'m str, ArrowError> {
+        let field_id = self.try_field_id(i)?;
+        self.metadata.get(field_id as _)
+    }
+
+    /// Get a field's id by index in `0..self.len()`: its entry in the metadata
+    /// dictionary, which [`VariantMetadata::get`] and
+    /// [`VariantMetadata::name_bytes`] resolve to the field's name.
+    ///
+    /// # Panics
+    /// If the variant object is corrupted (e.g., invalid field id bytes).
+    pub fn field_id(&self, i: usize) -> Option<u32> {
+        (i < self.len()).then(|| {
+            self.try_field_id(i)
+                .expect("Invalid variant object field id")
+        })
+    }
+
+    /// Fallible version of `field_id`. Returns the field id by index, capturing validation errors
+    fn try_field_id(&self, i: usize) -> Result<u32, ArrowError> {
         let byte_range = self.header.field_ids_start_byte() as _..self.first_field_offset_byte as _;
         let field_id_bytes = slice_from_slice(self.value, byte_range)?;
-        let field_id = self.header.field_id_size.unpack_u32(field_id_bytes, i)?;
-        self.metadata.get(field_id as _)
+        self.header.field_id_size.unpack_u32(field_id_bytes, i)
     }
 
     /// Returns an iterator of (name, value) pairs over the fields of this object.
     pub fn iter(&self) -> impl Iterator<Item = (&'m str, Variant<'m, 'v>)> + '_ {
         self.iter_try_with_shallow_validation()
             .map(|result| result.expect("Invalid variant object field value"))
+    }
+
+    /// Returns an iterator of (field id, value) pairs over the fields of this object, in the
+    /// same order as [`Self::iter`]. A caller that routes fields by their dictionary entry can
+    /// skip the name lookup [`Self::iter`] performs for every field.
+    pub fn iter_with_field_ids(&self) -> impl Iterator<Item = (u32, Variant<'m, 'v>)> + '_ {
+        (0..self.len()).map(|i| {
+            let field_id = self
+                .try_field_id(i)
+                .expect("Invalid variant object field id");
+            let value = self
+                .try_field_with_shallow_validation(i)
+                .expect("Invalid variant object field value");
+            (field_id, value)
+        })
     }
 
     /// Fallible iteration over the fields of this object.

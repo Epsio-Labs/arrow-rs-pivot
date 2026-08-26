@@ -17,8 +17,8 @@
 
 use crate::decoder::{OffsetSizeBytes, map_bytes_to_offsets};
 use crate::utils::{
-    first_byte_from_slice, overflow_error, slice_from_slice, string_from_slice,
-    try_binary_search_range_by,
+    first_byte_from_slice, overflow_error, slice_from_slice, slice_from_slice_at_offset,
+    string_from_slice, try_binary_search_range_by,
 };
 
 use arrow_schema::ArrowError;
@@ -358,6 +358,15 @@ impl<'m> VariantMetadata<'m> {
     pub fn get(&self, i: usize) -> Result<&'m str, ArrowError> {
         let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
         string_from_slice(self.bytes, self.first_value_byte as _, byte_range)
+    }
+
+    /// Attempts to retrieve the raw bytes of a dictionary entry by index, failing if out of
+    /// bounds. Unlike [`Self::get`] this does not check that the entry is valid UTF-8, which
+    /// suits a caller that only compares names for equality or order: byte equality is string
+    /// equality, and the dictionary's sort order is byte order.
+    pub fn name_bytes(&self, i: usize) -> Result<&'m [u8], ArrowError> {
+        let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
+        slice_from_slice_at_offset(self.bytes, self.first_value_byte as _, byte_range)
     }
 
     // Helper method used by our `impl Index` and also by `get_entry`. Panics if the underlying
